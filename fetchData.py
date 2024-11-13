@@ -1,5 +1,6 @@
 import os
 import pandas as pd
+from datetime import datetime, timezone
 import h5py
 import re
 
@@ -8,48 +9,145 @@ file_extension ={'CWAM' : 'h5',
                  'METAR' : 'txt', 
                  'TAF' : 'txt'}
 
+# Define cloud cover dictionary for sky cover conversion
+cloud_cover_dict = {
+    "SKC": 0,  # Sky Clear
+    "CLR": 0,  # Clear
+    "NSC": 0,  # No Significant Clouds
+    "NCD": 0,  # No Cloud Detected
+    "FEW": 1,  # Few (1/8 to 2/8 sky cover)
+    "SCT": 3,  # Scattered (3/8 to 4/8 sky cover)
+    "BKN": 5,  # Broken (5/8 to 7/8 sky cover)
+    "OVC": 8,  # Overcast (8/8 sky cover)
+    "VV": 9    # Vertical Visibility (obscured sky, treated as full overcast)
+}
+
+
 username = os.getlogin()
 home_dir = 'home'
 project_name = 'finalProject'
 data_dir_file =  'data'
 defult_base_dir = os.path.join('/', home_dir, username, project_name, data_dir_file)
 
+def parse_cloud_layers(cloud_layers):
+    """Convert cloud layer codes to structured data for modeling."""
+    parsed_layers = []
+    for layer in cloud_layers:
+        # Match cloud layer code, altitude, and CB flag if present
+        match = re.match(r"([A-Z]{3})(\d{3})?(CB)?", layer)
+        if match:
+            cloud_code, altitude, cumulonimbus = match.groups()
+            sky_cover = cloud_cover_dict.get(cloud_code, None)  # Get sky cover value
+            altitude_ft = int(altitude) * 100 if altitude else None  # Convert altitude to feet if present
+            cb_flag = 1 if cumulonimbus else 0  # Cumulonimbus flag (1 for CB, 0 otherwise)
+
+            # Append the structured cloud data
+            parsed_layers.append({
+                "sky_cover": sky_cover,           # Numerical sky cover level
+                "altitude_ft": altitude_ft,       # Altitude in feet
+                "cumulonimbus": cb_flag           # Cumulonimbus presence (1 or 0)
+            })
+    return parsed_layers
+
 def get_defult_base_dir():
     return defult_base_dir
 
+# Enhanced METAR pattern to capture complex remarks and additional fields
+metar_pattern = re.compile(
+    r'^(?P<station>[A-Z0-9]{4})\s+'                        # Station code
+    r'(?P<datetime>\d{2}\d{4}Z)\s+'                     # Date and time
+    r'(?P<cor>COR\s+)?'                                 # Optional correction indicator
+    r'(?P<auto>AUTO\s+)?'                               # Optional AUTO indicator
+    r'(?P<wind>(VRB|\d{3}|/////)\d{2}(G\d{2})?(KT|MPS|KMH)?\s*(\d{3}V\d{3})?)?\s*'  # Wind information
+    r'(?P<visibility>////|CAVOK|\d{4}(SM|NDV)?|[0-9]+SM)?\s*'  # Visibility
+    r'(?P<weather>[\+\-]?[A-Z]{2,6}\s*)?'               # Optional weather phenomena
+    r'(?P<clouds>((FEW|SCT|BKN|OVC|NSC|VV|NCD|CLR|SKC|///)\d{0,3}(CB)?\s*)*)'  # Cloud layers
+    r'(?:(?P<temperature>M?\d{2}|//)/(?P<dewpoint>M?\d{2}|//)\s+)?'    # Optional temperature and dewpoint
+    r'(?:(?P<pressure_indicator>[QA])(?P<pressure_value>\d{4}|////)(=)?\s*)?'  # Optional pressure with optional '='
+    r'(?P<has_rmk>RMK\s+)?'                            # Optional RMK section
+)
+
 # Parse METAR report 
 def parse_metar_line(date_time, line):
-    """Parse a single METAR report line into its components, including optional AUTO."""
-    metar_pattern = re.compile(
-        r'^(?P<station>[A-Z]{4})\s+'
-        r'(?P<datetime>\d{2}\d{4}Z)\s+'
-        r'(?P<auto>AUTO\s+)?'
-        r'(?P<wind>\d{3}\d{2}(G\d{2})?(KT|MPS|KMH))?\s*'
-        r'(?P<visibility>\d{4}(SM|NDV)?|CAVOK|////)?\s*'
-        r'(?P<clouds>(///\d{3}///|FEW|SCT|BKN|OVC|NSC|VV|///)\d{0,3}[A-Z]{0,3}\s*)*'
-        r'(?P<temperature>M?\d{2})/(?P<dewpoint>M?\d{2}|//)\s+'
-        r'Q(?P<pressure>\d{4})\s*'
-        r'(?P<remarks>.+)?$'
-    )
-    
+    match = metar_pattern.match(line)
     match = metar_pattern.match(line)
     if match:
         data = match.groupdict()
+
+        # Convert `date_time` to UTC format
+        try:
+            utc_date = datetime.strptime(date_time, "%Y/%m/%d %H:%M").replace(tzinfo=timezone.utc)
+            data['date_time'] = utc_date.strftime("%Y-%m-%d %H:%M:%S")
+            data['date_time'] = pd.to_datetime(data['date_time'], utc=True)
+        except ValueError as e:
+            data['date_time'] = None
+            
+        # AUTO handling
+        data['auto'] = True if data.get('clouds') == 'AUTO' else False
         
-        # Process the clouds group to handle multiple cloud layers
+        # Process cloud layers into structured data
         clouds = data.get('clouds')
-        if clouds:
-            data['clouds'] = clouds.strip().split()
+        data['cloud_layers'] = parse_cloud_layers(clouds.strip().split()) if clouds else []
+
+        # Temperature conversion
+        if data.get('temperature'):
+            data['temperature'] = float(data['temperature'].replace("M", "-")) if data['temperature'] != "//" else None
         else:
-            data['clouds'] = None
+            data['temperature'] = None
         
-        data['date_time'] = date_time
-        # Handle optional fields
-        data['auto'] = data['auto'].strip() if data['auto'] else None
-        data['remarks'] = data['remarks'].strip() if data['remarks'] else None
+        if data.get('dewpoint'):
+            data['dewpoint'] = float(data['dewpoint'].replace("M", "-")) if data['dewpoint'] and data['dewpoint'] != "//" else None
+        else:
+            data['dewpoint'] = None
+
+        # Visibility conversion (to meters)
+        visibility = data.get('visibility')
+        if visibility == "CAVOK":
+            data['visibility_meters'] = 10000  # Convention for CAVOK
+        elif visibility and "SM" in visibility:
+            visibility_miles = float(visibility.replace("SM", ""))
+            data['visibility_meters'] = int(visibility_miles * 1609.34)
+        elif visibility and visibility.isdigit():
+            data['visibility_meters'] = int(visibility)
+        else:
+            data['visibility_meters'] = None
+
+        # Wind speed conversion (to m/s)
+        wind = data.get('wind')
+        if wind and "/////" not in wind:  # Handle missing wind speed
+            wind_speed_match = re.search(r'\d{2}', wind)
+            wind_speed = int(wind_speed_match.group()) if wind_speed_match else 0
+            if "KT" in wind:
+                data['wind_speed_mps'] = round(wind_speed * 0.514444, 2)
+            elif "KMH" in wind:
+                data['wind_speed_mps'] = round(wind_speed / 3.6, 2)
+            elif "MPS" in wind:
+                data['wind_speed_mps'] = wind_speed
+            else:
+                data['wind_speed_mps'] = None
+        else:
+            data['wind_speed_mps'] = None
+
+        # Pressure handling with unit conversion
+        pressure_indicator = data.get('pressure_indicator')
+        pressure_value = data.get('pressure_value')
+        if pressure_value and pressure_value != "////":
+            if pressure_indicator == "A":
+                # Convert inHg (A) to hPa (Q) by multiplying by 33.8639
+                data['pressure'] = round(int(pressure_value) * 33.8639 / 100, 2)
+            elif pressure_indicator == "Q":
+                data['pressure'] = int(pressure_value)
+            else:
+                data['pressure'] = None
+        else:
+            data['pressure'] = None
         
-        return data
-    
+        fields_to_drop = ['datetime', 'wind', 'clouds', 'visibility', 'pressure_indicator', 'pressure_value', 'has_rmk']
+        processed_data = data.copy() 
+        for field in fields_to_drop:
+            if field in processed_data:
+                del processed_data[field]
+        return processed_data
     return None
 
 # Parse TAF report 
@@ -182,7 +280,7 @@ def load_data(data_type, dataset_purpose, path_level=None, month=None, day=None,
         return df
     elif data_type in ["METAR", "TAF"]:
         if data_type == "METAR":
-            with open(file_path, 'r') as file:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as file:
                 lines = file.readlines()
                 lines = [line.strip() for line in lines if line.strip()]
                 data_entries = []
@@ -192,6 +290,7 @@ def load_data(data_type, dataset_purpose, path_level=None, month=None, day=None,
                     # Check if the line is a date line
                     if re.match(r'\d{4}/\d{2}/\d{2} \d{2}:\d{2}', line):
                         date_time = line  # Store the date and time
+                        #print(date_time)
                     elif date_time:  # If we have a date_time, process the METAR line
                         parsed_data = parse_metar_line(date_time, line)
                         if parsed_data:
