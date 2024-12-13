@@ -1,3 +1,3 @@
 # cs523Final
-## Team member
+## Team Members
 Jingbo Wang, Chengkai Yang
